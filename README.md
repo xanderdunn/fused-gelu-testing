@@ -1,9 +1,9 @@
 ### Setup
+- Locally install the gcloud command line interface: `brew install gcloud`, this assumes you already have Homebrew installed on your local Mac
 - Create a GCP instance running Ubuntu 20.04 with 1 A100:
 ```
 gcloud compute instances create magic-dev-testing-5 --project=magic-dev-377020 --zone=us-central1-a --machine-type=a2-highgpu-1g --network-interface=network-tier=PREMIUM,subnet=default --maintenance-policy=TERMINATE --provisioning-model=STANDARD --service-account=667948917105-compute@developer.gserviceaccount.com --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/trace.append --accelerator=count=1,type=nvidia-tesla-a100 --create-disk=auto-delete=yes,boot=yes,device-name=magic-dev-testing-5,image=projects/ubuntu-os-cloud/global/images/ubuntu-2004-focal-v20230125,mode=rw,size=300,type=projects/magic-dev-377020/zones/us-central1-a/diskTypes/pd-ssd --no-shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring --reservation-affinity=any
 ```
-- Locally install the gcloud command line interface: `brew install gcloud`, this assumes you already have Homebrew installed on your local Mac
 - Add to ~/.profile: `source "/opt/homebrew/Caskroom/google-cloud-sdk/latest/google-cloud-sdk/path.bash.inc"`
 - SSH into it: `gcloud compute ssh --zone "us-central1-a" "magic-dev-testing-5"  --project "magic-dev-377020"`
 - Verify you're on Ubuntu 20.04 Focal: `cat /etc/os-release`
