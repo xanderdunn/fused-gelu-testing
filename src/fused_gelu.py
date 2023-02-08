@@ -83,14 +83,13 @@ def gelu_fast(x):
             0.5 * x * (1.0 + tl.libdevice.tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x)))
            )
 
-
 @triton.jit
 def gelu_fast_prime(x):
     # From https://arxiv.org/pdf/2104.02523.pdf
-    # FIXME: Need cross product with the last parentheses
-    denominator = tl.libdevice.cosh(0.0356774 * x * x * x + 0.797885 * x)
+    term1 = 0.0356774 * x * x * x + 0.797885 * x
+    denominator = tl.libdevice.cosh(term1)
     return (
-            0.5 * tl.libdevice.tanh(0.0356774 * x * x * x + 0.797885 * x) + 0.5 + (0.0535161 * x * x * x + 0.398942 * x) * (1 / (denominator * denominator))
+            0.5 * tl.libdevice.tanh(term1) + 0.5 + (0.0535161 * x * x * x + 0.398942 * x) * (1.0 / (denominator * denominator))
            )
 
 
