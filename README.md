@@ -1,3 +1,6 @@
+### Run
+After setup below, run the fused GELU with `./src/fused_gelu.py`
+
 ### Setup
 - Locally install the gcloud command line interface: `brew install gcloud`, this assumes you already have Homebrew installed on your local Mac
 - Create a GCP instance running Ubuntu 20.04 with 1 A100:
@@ -55,6 +58,7 @@ Cuda compilation tools, release 11.7, V11.7.99
 Build cuda_11.7.r11.7/compiler.31442593_0
 ```
 - Install pip3: `sudo apt install -y python3-pip`
+- Cleanup installed packages that are no longer needed: `sudo apt autoremove`
 - `pip3 install torch`
 - Check pytorch: `python3 -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count()); print(torch.cuda.current_device()); print(torch.cuda.get_device_name(0)); print(torch.version.cuda)"`
 ```
@@ -65,7 +69,13 @@ True
 NVIDIA A100-SXM4-40GB
 11.7
 ```
-- Install triton pre-release: `pip3 install --pre -U triton`, the latest stable is too old.
+- Install triton from source because both the stable and pre-release packages are too old, instructions from [here](https://github.com/openai/triton#install-from-source):
+```
+git clone https://github.com/openai/triton.git;
+cd triton/python;
+pip install cmake; # build time dependency
+pip install -e .
+```
 - Install triton example dependences: `pip3 install numpy matplotlib pandas`
 - Check triton
     - Download the example matrix multiplication code from [here](https://triton-lang.org/master/getting-started/tutorials/03-matrix-multiplication.html): `wget https://triton-lang.org/master/_downloads/d5fee5b55a64e47f1b5724ec39adf171/03-matrix-multiplication.py`
@@ -122,4 +132,3 @@ matmul-performance:
 29  3968.0  248.521248                     231.544472  244.536938            241.154018
 30  4096.0  264.208112                     244.922869  236.715565            233.828792
 ```
-- `sudo apt autoremove`
