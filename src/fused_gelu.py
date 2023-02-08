@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def matmul_kernel_custom(
+def matmul_chunk_gelu(
         # Pointers to matrices
         a_ptr, b_ptr, c_ptr,
         # Matrix dimensions
@@ -20,8 +20,11 @@ def matmul_kernel_custom(
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr,
         ):
-    """Kernel for computing the matmul C = A x B.
-    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """
+    1) Compute matmul C = A x B into two halves, X1 and X2
+    2) Compute C = X1 * gelu(X2)
+    3) Return C
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N//2)
     """
     # L2 Cache Optimizations
     pid = tl.program_id(axis=0)
@@ -47,7 +50,7 @@ def matmul_kernel_custom(
     x2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # Matrix multiply A and B, accumulating the first half of columns into x1 and
     # the second half of columns into x2
-    for k in range(0, K, BLOCK_SIZE_K): # type: ignore
+    for _ in range(0, K, BLOCK_SIZE_K): # type: ignore
         a = tl.load(a_ptrs)
 
         b_left = tl.load(b_left_ptrs)
@@ -109,7 +112,7 @@ def matmul(a, b):
     grid = lambda META: (
             triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
             )
-    matmul_kernel_custom[grid]( # type: ignore
+    matmul_chunk_gelu[grid]( # type: ignore
         a, b, c,
         M, N, K,
         a.stride(0), a.stride(1),
