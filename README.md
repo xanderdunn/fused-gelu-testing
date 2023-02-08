@@ -1,3 +1,20 @@
+### Problem
+Implement a fused GELU layer in triton. In pytorch this looks something like this:
+```python
+def forward(self,
+            x: torch.Tensor # [Batch, d_model]
+            ) -> torch.Tensor:
+    x = self.linear(x) # linear laying mapping d_model to 8 * d_model
+    x1, x2 = x.chunk(2, dim=(x.ndim -1))
+    return x1 * gelu_fast(x2)
+
+def gelu_fast(x):
+    return (
+            0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x)))
+           )
+```
+Setup an A100 machine for testing and implement both the forward and backward pass in triton.
+
 ### Run
 After setup below, run the fused GELU with `./src/fused_gelu.py`
 
