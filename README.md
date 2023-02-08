@@ -1,6 +1,11 @@
 ### Run
 After setup below, run the fused GELU with `./src/fused_gelu.py`
 
+### TODO
+- Run benchmark against pytorch to see that the fused kernel offers performance improvement
+- Add the bias addition to the fused gelu forward kernel
+- Implement the backprop
+
 ### Setup
 - Locally install the gcloud command line interface: `brew install gcloud`, this assumes you already have Homebrew installed on your local Mac
 - Create a GCP instance running Ubuntu 20.04 with 1 A100:
