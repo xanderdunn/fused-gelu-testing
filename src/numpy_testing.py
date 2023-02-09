@@ -34,14 +34,13 @@ class NumpyNN():
         Backward pass of the linear layer with partial gelu activation.
         This returns the gradient of the linear layer's weights.
         """
-        return np.matmul(grad, x)
-
+        return np.matmul(grad.T, x)
 
 class TorchNN():
 
     def __init__(self, d_model: int):
         # self.W = W
-        self.linear = torch.nn.Linear(d_model, d_model, bias=False)
+        self.linear = torch.nn.Linear(d_model, d_model * 2, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x)
@@ -51,15 +50,15 @@ def main():
     torch.manual_seed(0)
     np.random.seed(0)
 
-    d_model = 64
-    batch_size = 64
+    d_model = 2
+    batch_size = 2
     x = torch.randn(batch_size, d_model, device='cpu') # input
     # W = torch.randn(d_model, d_model, device='cpu', requires_grad=True) # weights
 
     # PyTorch
     torch_nn = TorchNN(d_model)
     torch_forward = torch_nn.forward(x)
-    grad = torch.ones(batch_size, d_model, device='cpu')
+    grad = torch.ones(batch_size, d_model * 2, device='cpu')
     torch_forward.backward(grad)
     torch_grad = torch_nn.linear.weight.grad
 
