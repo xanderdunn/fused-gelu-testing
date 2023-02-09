@@ -51,21 +51,28 @@ def gelu_partial_layer_fused_forward(
     # Matrix multiply A and B, accumulating the first half of columns into x1 and
     # the second half of columns into x2
     for _ in range(0, K, BLOCK_SIZE_K): # type: ignore
-        a = tl.load(x_ptrs)
+        x = tl.load(x_ptrs)
 
         W_left = tl.load(W_left_ptrs)
-        z1 += tl.dot(a, W_left)
+        z1 += tl.dot(x, W_left)
 
         W_right = tl.load(W_right_ptrs)
-        z2 += tl.dot(a, W_right)
+        z2 += tl.dot(x, W_right)
 
         # Advance the ptrs to the next K block
         x_ptrs += BLOCK_SIZE_K * stride_xk
         W_left_ptrs += BLOCK_SIZE_K * stride_Wk
         W_right_ptrs += BLOCK_SIZE_K * stride_Wk
 
-    # TODO: Store z1 in z1_ptr
-    # TODO: Store z2 in z2_ptr
+    # Store z1 in z1_ptr
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    z1_ptrs = z1_ptr + stride_Am * offs_cm[:, None] + stride_An * offs_cn[None, :]
+    outs_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N // 2)
+    tl.store(z1_ptrs, z1, mask=outs_mask)
+    # Store z2 in z2_ptr
+    z2_ptrs = z2_ptr + stride_Am * offs_cm[:, None] + stride_An * offs_cn[None, :]
+    tl.store(z2_ptrs, z2, mask=outs_mask)
 
     # Element-wise multiply of z1 and gelu(z2)
     z2 = gelu_fast(z2)
@@ -73,14 +80,31 @@ def gelu_partial_layer_fused_forward(
     c = c.to(tl.float16)
 
     # Write back the block of the output matrix C
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     A_ptrs = A_ptr + stride_Am * offs_cm[:, None] + stride_An * offs_cn[None, :]
-    A_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N // 2)
-    tl.store(A_ptrs, c, mask=A_mask)
+    tl.store(A_ptrs, c, mask=outs_mask)
 
 @triton.jit
-def gelu_partial_layer_fused_backward(x_ptr, W_ptr, z1_ptr, z2_ptr, dA_ptr, dW_ptr):
+def gelu_partial_layer_fused_backward(
+        x_ptr, W_ptr, z1_ptr, z2_ptr, dA_ptr, dW_ptr, dA1_ptr, dA2_ptr,
+        M, N,
+        stride_dA_half_m,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+    ):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE_M
+    offsets = block_start + tl.arange(0, BLOCK_SIZE_M)
+
+    offsets = block_start + tl.arange(0, BLOCK_SIZE_M)
+    for _ in range(0, M, BLOCK_SIZE_M):
+        dA = tl.load(dA_ptr + offsets)
+        z1 = tl.load(z1_ptr + offsets)
+        z2 = tl.load(z2_ptr + offsets)
+        dA1 = dA * gelu_fast(z2)
+        dA2 = dA * z1
+        tl.store(dA1_ptr + offsets, dA1)
+        tl.store(dA2_ptr + offsets, dA2)
+        offsets += BLOCK_SIZE_M * stride_dA_half_m
     # dA1 = dA * gelu(z2)
     # dz1 = dA1 # there's no activation function on this half
     # dW1 = np.matmul(dz1.T, x).T
@@ -120,6 +144,10 @@ def gelu_fast_prime(x):
     hyp_secant *= hyp_secant
     return 0.5 * tl.libdevice.tanh(term1 + term3) + (term4 + term2) * hyp_secant + 0.5
 
+triton_z1 = None
+triton_z2 = None
+triton_dA1 = None
+triton_dA2 = None
 
 class PartialGeluLayer(torch.autograd.Function):
 
@@ -136,8 +164,8 @@ class PartialGeluLayer(torch.autograd.Function):
                 ), "We don't check memory-out-of-bounds with K so K must be divisible by BLOCK_SIZE_K"
         # allocates output
         A = torch.empty((M, N // 2), device=x.device, dtype=x.dtype)
-        z1 = torch.empty((M, N), device=x.device, dtype=x.dtype) # same dimensions as the weights
-        z2 = torch.empty((M, N), device=x.device, dtype=x.dtype)
+        z1 = torch.empty((M, N // 2), device=x.device, dtype=x.dtype) # same dimensions as the weights
+        z2 = torch.empty((M, N // 2), device=x.device, dtype=x.dtype)
         # 1D launch kernel where each block gets its own program.
         grid = lambda META: (
                 triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
@@ -155,17 +183,35 @@ class PartialGeluLayer(torch.autograd.Function):
             BLOCK_SIZE_K=16, # type: ignore
             GROUP_SIZE_M=8, # type: ignore
         )
+        global triton_z1
+        global triton_z2
+        triton_z1 = z1
+        triton_z2 = z2
         ctx.save_for_backward(x, W, z1, z2)
         return A
 
     def backward(ctx, dA: torch.Tensor) -> torch.Tensor:
         x, W, z1, z2 = ctx.saved_tensors
+        M, K = x.shape
+        K, N = W.shape
         dW = torch.empty(W.shape, device=x.device, dtype=x.dtype)
+        dA1 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
+        dA2 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
         grid = lambda META: (
                 triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
                 )
-        gelu_partial_layer_fused_backward[grid](x, W, z1, z2, dA, dW)
-        return dW
+        gelu_partial_layer_fused_backward[grid](
+                x, W, z1, z2, dA, dW, dA1, dA2,
+                M, N,
+                stride_dA_half_m=dA1.stride(0),
+                BLOCK_SIZE_M=32,
+                BLOCK_SIZE_N=32, # type: ignore
+        )
+        global triton_dA1
+        global triton_dA2
+        triton_dA1 = dA1
+        triton_dA2 = dA2
+        return None, dW
 
 
 class TorchNN():
@@ -190,6 +236,7 @@ def main():
     torch.manual_seed(0)
     # input to feed forward
     x = torch.randn((batch_size, d_model), device='cuda', dtype=torch.float16)
+    x.requires_grad_(True)
 
     torch_nn = TorchNN(d_model)
     torch_forward = torch_nn.forward(x)
@@ -197,13 +244,35 @@ def main():
     linear_weights = torch_nn.linear.state_dict()["weight"].T.contiguous()
     # biases = torch_nn.linear.state_dict()["bias"]
     triton_forward = partial_gelu(x, linear_weights)
-    print(f"torch_forward={torch_forward}")
-    print(f"triton_forward={triton_forward}")
+
+    # Test that the portions of Z were stored correctly for retrieval by the backward pass
+    Z = torch_nn.linear(x)
+    torch_z1, torch_z2 = torch.chunk(Z, 2, dim=1)
+    triton.testing.assert_almost_equal(torch_z1, triton_z1)
+    triton.testing.assert_almost_equal(torch_z2, triton_z2)
+
+    # print(f"torch_forward={torch_forward}")
+    # print(f"triton_forward={triton_forward}")
     if triton.testing.allclose(triton_forward, torch_forward):
         print("Forward: ✅ Triton and Torch match")
     else:
         print("Forward: ❌ Triton and Torch differ")
     # TODO: Benchmark the two implementations across increasing sizes of matrices
+
+
+    dA = torch.randn(batch_size, d_model * 8 // 2, device=x.device, dtype=x.dtype)
+    torch_forward.backward(dA)
+    torch_grad = torch_nn.linear.weight.grad
+    assert torch_grad is not None
+    torch_grad = torch_grad.T
+
+    triton_grad = triton_forward.backward(dA)
+
+    # Test that the individual components of the backward pass are correct
+    torch_dA1 = dA * torch_nn.gelu(torch_z2)
+    torch_dA2 = dA * torch_z1
+    triton.testing.assert_almost_equal(torch_dA1, triton_dA1)
+    triton.testing.assert_almost_equal(torch_dA2, triton_dA2)
 
 
 if __name__ == "__main__":
