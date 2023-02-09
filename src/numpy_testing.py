@@ -58,7 +58,7 @@ def main():
     # PyTorch
     torch_nn = TorchNN(d_model)
     torch_forward = torch_nn.forward(x)
-    grad = torch.ones(batch_size, d_model * 2, device='cpu')
+    grad = torch.randn(batch_size, d_model * 2, device='cpu')
     torch_forward.backward(grad)
     torch_grad = torch_nn.linear.weight.grad
 
