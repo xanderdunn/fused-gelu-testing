@@ -5,21 +5,27 @@ import numpy as np
 import triton
 
 
+def relu(x):
+    return np.maximum(0, x)
+
+def relu_prime(x):
+    return (x > 0).astype(x.dtype)
+
+
+# This has been tested as producing the same result as the pytorch GELU
 def gelu(x):
-    return (
-            0.5 * x * (1.0 + np.tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x)))
-           )
+    return (0.5 * x * (1.0 + np.tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x))))
 
-def gelu_prime(x):
-    return 0.5 * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3))) + 0.5 * x * (
-        1 - np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))**2 * np.sqrt(2 / np.pi) * (1 + 0.044715 * 3 * x**2)
-
-# nn_forward(x):
-    # return x * x
-
-# nn_backward(x, grad):
-    # return 2 * x
-
+# From https://github.com/MarkTigchelaar/Tinman/blob/27a492c06105d550d7eacd2ca9fadc089d484c3a/src/neural_network_parts/activator.rs#L232
+# In my testing this is a close but not exact approximation of the backward pass of the pytorch GELU()
+def gelu_prime(x: np.ndarray) -> np.ndarray:
+    term1 = 0.0356774 * x * x * x;
+    term2 = 0.398942 * x;
+    term3 = 0.797885 * x;
+    term4 = 0.0535161  * x * x * x;
+    hyp_secant = 1 / np.cosh(term1 + term3);
+    hyp_secant *= hyp_secant;
+    return 0.5 * np.tanh(term1 + term3) + (term4 + term2) * hyp_secant + 0.5
 
 class NumpyNN():
 
@@ -27,32 +33,45 @@ class NumpyNN():
         self.W = W
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        return np.matmul(x, self.W)
+        Z = np.matmul(x, self.W)
+        A = gelu(Z)
+        # A = relu(Z)
+        return A
 
-    def backward(self, x: np.ndarray, grad: np.ndarray) -> np.ndarray:
+    def backward(self, x: np.ndarray, dA: np.ndarray) -> np.ndarray:
         """
         Backward pass of the linear layer with partial gelu activation.
         This returns the gradient of the linear layer's weights.
         """
-        return np.matmul(grad.T, x)
+        Z = np.matmul(x, self.W)
+        dZ = dA * gelu_prime(Z)
+        # dZ = dA * relu_prime(Z)
+        dW = np.dot(dZ.T, x)
+        return dW
+
 
 class TorchNN():
 
     def __init__(self, d_model: int):
         # self.W = W
         self.linear = torch.nn.Linear(d_model, d_model * 2, bias=False)
+        self.gelu = torch.nn.GELU()
+        # self.relu = torch.nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        Z = self.linear(x)
+        A = self.gelu(Z)
+        # A = self.relu(Z)
+        return A
 
 
 def main():
     torch.manual_seed(0)
     np.random.seed(0)
 
-    d_model = 2
-    batch_size = 2
-    x = torch.randn(batch_size, d_model, device='cpu') # input
+    d_model = 16
+    batch_size = 16
+    x = torch.randn(batch_size, d_model, device='cpu')  # input
     # W = torch.randn(d_model, d_model, device='cpu', requires_grad=True) # weights
 
     # PyTorch
