@@ -3,7 +3,6 @@
 import torch
 import numpy as np
 import triton
-from torchviz import make_dot
 
 
 def relu(x):
@@ -36,46 +35,45 @@ class NumpyNN():
     def forward(self, x: np.ndarray) -> np.ndarray:
         Z = np.matmul(x, self.W)
         z1, z2 = np.split(Z, 2, axis=1)
-        # A = z1 * gelu(z2)
-        # My guess is that dA = dz1 * 
-        A = np.concatenate((z1, gelu(z2)), axis=1)
-        return A
+        return z1 * gelu(z2)
 
-    def backward(self, x: np.ndarray, # [2, 2] this is the activation of the previous step, for the first step that's the input matrix
-                 dA: np.ndarray # [2, 4] this is the gradient of this step, provided by the previous step of backprop (the previous layer)
+    # Key insight here is that the backward pass on an element-wise matix multiplication is 
+    # the element-wise multiplication with the other matrix
+    # A = z1 * gelu(z2)
+    # dA1 = dA * gelu(z2)
+    # dA2 = dA * z1
+    def backward(self, x: np.ndarray, # this is the activation of the previous step, for the first step that's the input matrix
+                 dA: np.ndarray # this is the gradient of this step, provided by the previous step of backprop (the previous layer)
                 ) -> np.ndarray:
         """
         Backward pass of the linear layer with partial gelu activation.
         This returns the gradient of the linear layer's weights.
         """
-        assert x.shape == (2, 2), f"Expected x to be [2, 2], got {x.shape}"
-        dA1, dA2 = np.split(dA, 2, axis=1) # [2, 2] and [2, 2]
-        Z = np.matmul(x, self.W) # [2, 4]
-        _, z2 = np.split(Z, 2, axis=1) # [2, 2] and [2, 2]
+        Z = np.matmul(x, self.W)
+        z1, z2 = np.split(Z, 2, axis=1)
 
+        dA1 = dA * gelu(z2)
         dz1 = dA1 # there's no activation function on this half
         dW1 = np.matmul(dz1.T, x).T
-        # dW1 = np.split(np.matmul(dA.T, x).T, 2, axis=1)[0] # [2, 2]
 
-        dz2 = dA2 * gelu_prime(z2) # [2, 2]
-        dW2 = np.matmul(dz2.T, x).T # [2, 2]
+        dA2 = dA * z1
+        dz2 = dA2 * gelu_prime(z2)
+        dW2 = np.matmul(dz2.T, x).T
 
-        dW = np.concatenate((dW1, dW2), axis=1) # (2, 4)
-        # assert dW.shape == self.W.shape, f"Expected dW to be {self.W.shape}, got {dW.shape}"
+        dW = np.concatenate((dW1, dW2), axis=1)
         return dW
 
 
 class TorchNN():
 
     def __init__(self, d_model: int):
-        self.linear = torch.nn.Linear(d_model, d_model * 2, bias=False)
+        self.linear = torch.nn.Linear(d_model, d_model * 8, bias=False)
         self.gelu = torch.nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         Z = self.linear(x)
         z1, z2 = torch.chunk(Z, 2, dim=1)
-        A = torch.cat((z1, self.gelu(z2)), 1)
-        # A = z1 * self.gelu(z2)
+        A = z1 * self.gelu(z2)
         return A
 
 
@@ -83,16 +81,15 @@ def main():
     torch.manual_seed(0)
     np.random.seed(0)
 
-    d_model = 2
-    batch_size = 2
+    d_model = 8
+    batch_size = 4
     x = torch.randn(batch_size, d_model, device='cpu')  # input
 
     # PyTorch
     torch_nn = TorchNN(d_model)
     torch_forward = torch_nn.forward(x)
     # This is dA, or some upstream gradient that we must backpropagate
-    grad = torch.ones(batch_size, d_model * 2, device='cpu')
-    make_dot(torch_forward).render("test", format="png")
+    grad = torch.randn(batch_size, d_model * 8 // 2, device='cpu')
     torch_forward.backward(grad)
     torch_grad = torch_nn.linear.weight.grad
     assert torch_grad is not None
@@ -104,7 +101,7 @@ def main():
     numpy_nn = NumpyNN(W.detach().numpy())
     numpy_forward = numpy_nn.forward(x.detach().numpy())
     numpy_grad = numpy_nn.backward(x.detach().numpy(), grad.detach().numpy())
-    # assert numpy_grad.shape == W.shape
+    assert numpy_grad.shape == W.shape
 
     triton.testing.assert_almost_equal(torch_forward.detach().numpy(), numpy_forward)
     triton.testing.assert_almost_equal(torch_grad, numpy_grad)
