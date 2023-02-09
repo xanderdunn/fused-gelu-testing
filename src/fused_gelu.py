@@ -130,10 +130,8 @@ def matmul(a, b):
 
 class TorchNN():
     def __init__(self, d_model: int):
-        self.linear = torch.nn.Linear(d_model, 8 * d_model, device='cuda', dtype=torch.float16)
-        # TODO: Remove this once bias addition is added to the triton kernel
-        with torch.no_grad():
-            self.linear.bias.fill_(0.0)
+        # TODO: Add the bias back once the bias addition is added to the triton kernel
+        self.linear = torch.nn.Linear(d_model, 8 * d_model, device='cuda', dtype=torch.float16, bias=False)
         self.gelu = torch.nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -155,7 +153,7 @@ def main():
     torch_nn = TorchNN(d_model)
     torch_forward = torch_nn.forward(x)
 
-    linear_weights = torch.transpose(torch_nn.linear.state_dict()["weight"], 0, 1).contiguous()
+    linear_weights = torch_nn.linear.state_dict()["weight"].T.contiguous()
     # biases = torch_nn.linear.state_dict()["bias"]
     triton_forward = matmul(x, linear_weights)
     print(f"torch_forward={torch_forward}")
