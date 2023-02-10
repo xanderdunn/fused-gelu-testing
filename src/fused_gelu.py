@@ -95,27 +95,101 @@ def gelu_partial_layer_fused_backward(
     offsets = block_start + tl.arange(0, BLOCK_SIZE_M)
 
     # These operations can be done in blocks by row
-    dz1 = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.float32)
-    dz2 = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.float32)
+    # dz1 = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.float32)
+    # dz2 = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.float32)
     offsets = block_start + tl.arange(0, BLOCK_SIZE_M)
     for _ in range(0, M, BLOCK_SIZE_M):
         dA = tl.load(dA_ptr + offsets)
         z1 = tl.load(z1_ptr + offsets)
         z2 = tl.load(z2_ptr + offsets)
         dA1 = dA * gelu_fast(z2)
-        dz1 += dA1 # TODO: Is this accumulating as expected?
+        dz1 = dA1
 
         dA2 = dA * z1
-        dz2_piece = dA2 * gelu_fast_prime(z2)
-        dz2 += dz2_piece
+        dz2 = dA2 * gelu_fast_prime(z2)
         tl.store(dA1_ptr + offsets, dA1)
         tl.store(dA2_ptr + offsets, dA2)
-        tl.store(dz2_ptr + offsets, dz2_piece)
+        tl.store(dz2_ptr + offsets, dz2)
+        tl.store(dz1_ptr + offsets, dz1)
         offsets += BLOCK_SIZE_M * stride_dA_half_m
 
     dW1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     dW2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # TODO: Do the matmul for dW1 and dW2, how to handle the different block sizes?
+
+@triton.jit
+def gelu_partial_layer_fused_backward_matmul(
+        dz1_ptr, b_ptr, dz2_ptr, c_ptr, dW2_ptr,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+      GROUP_SIZE_M: tl.constexpr,
+        ):
+          # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse
+    # See above `L2 Cache Optimizations` section for details
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # a_ptrs is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # b_ptrs is a block of [BLOCK_SIZE_K, BLOCK_SIZE_n] pointers
+    # see above `Pointer Arithmetics` section for details
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    dz1_ptrs = dz1_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    dz2_ptrs = dz2_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    # -----------------------------------------------------------
+    # Iterate to compute a block of the C matrix
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # of fp32 values for higher accuracy.
+    # `accumulator` will be converted back to fp16 after the loop
+    accumulator_dW1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator_dW2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_SIZE_K):
+        # Note that for simplicity, we don't apply a mask here.
+        # This means that if K is not a multiple of BLOCK_SIZE_K,
+        # this will access out-of-bounds memory and produce an
+        # error or (worse!) incorrect results.
+        dz1 = tl.load(dz1_ptrs)
+        b = tl.load(b_ptrs)
+        dz2 = tl.load(dz2_ptrs)
+        # We accumulate along the K dimension
+        accumulator_dW1 += tl.dot(dz1, b)
+        accumulator_dW2 += tl.dot(dz2, b)
+        # Advance the ptrs to the next K block
+        dz1_ptrs += BLOCK_SIZE_K * stride_ak
+        dz2_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+    c = accumulator_dW1.to(tl.float16)
+    dW2 = accumulator_dW2.to(tl.float16)
+
+    # -----------------------------------------------------------
+    # Write back the block of the output matrix C
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    dW2_ptrs = dW2_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    out_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(dW2_ptrs, dW2, mask=out_mask)
+
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    tl.store(c_ptrs, c, mask=out_mask)
 
 @triton.jit
 def gelu_fast(x):
@@ -159,6 +233,8 @@ triton_dA1 = None
 triton_dA2 = None
 triton_dz2 = None
 triton_dz1 = None
+triton_dW1 = None
+triton_dW2 = None
 
 class PartialGeluLayer(torch.autograd.Function):
 
@@ -220,14 +296,39 @@ class PartialGeluLayer(torch.autograd.Function):
                 BLOCK_SIZE_M=32,
                 BLOCK_SIZE_N=32, # type: ignore
         )
+        # For debugging: Store the outputs to compare to pytorch
         global triton_dA1
         global triton_dA2
         global triton_dz1
         global triton_dz2
+        global triton_dW1
+        global triton_dW2
         triton_dA1 = dA1
         triton_dA2 = dA2
         triton_dz1 = dz1
         triton_dz2 = dz2
+        dz1 = dz1.T
+        dz2 = dz2.T
+        assert(dz1.shape[1] == x.shape[0])
+        assert(dz1.shape == dz2.shape)
+        M, K = dz1.shape
+        K, N = x.shape
+        dW1 = torch.zeros(M, N, device=x.device, dtype=x.dtype)
+        dW2 = torch.zeros(M, N, device=x.device, dtype=x.dtype)
+        dW = torch.zeros(M, N * 2, device=x.device, dtype=x.dtype)
+        gelu_partial_layer_fused_backward_matmul[grid](
+            dz1, x, dz2, dW1, dW2,
+            M, N, K,
+            dz1.stride(0), dz1.stride(1),
+            x.stride(0), x.stride(1),
+            dW1.stride(0), dW1.stride(1),
+            BLOCK_SIZE_M=32, # type: ignore
+            BLOCK_SIZE_N=32, # type: ignore
+            BLOCK_SIZE_K=16, # type: ignore
+            GROUP_SIZE_M=8, # type: ignore
+        )
+        triton_dW1 = dW1.T
+        triton_dW2 = dW2.T
         return None, dW
 
 
@@ -248,7 +349,7 @@ partial_gelu = PartialGeluLayer.apply
 def main():
     print("Doing a forward pass: Linear layer -> split in two by column -> GELU on the second half -> element-wise multiply of the first and second halves")
     print("In both pytorch and triton to compare correctness...")
-    batch_size = 512
+    batch_size = 512 # FIXME: The triton dA1, dA2 computations are wrong if this is not 512x512
     d_model = 512
     torch.manual_seed(0)
     # input to feed forward
@@ -268,8 +369,6 @@ def main():
     triton.testing.assert_almost_equal(torch_z1, triton_z1)
     triton.testing.assert_almost_equal(torch_z2, triton_z2)
 
-    # print(f"torch_forward={torch_forward}")
-    # print(f"triton_forward={triton_forward}")
     if triton.testing.allclose(triton_forward, torch_forward):
         print("Forward: ✅ Triton and Torch match")
     else:
@@ -290,11 +389,25 @@ def main():
     torch_dA2 = dA * torch_z1
     torch_dz1 = torch_dA1
     torch_dz2 = torch_dA2.detach().cpu().numpy() * gelu_prime(torch_z2.detach().cpu().numpy())
-    # print(f"triton_dz1 = {triton_dz1}")
+
     triton.testing.assert_almost_equal(torch_dA1, triton_dA1)
     triton.testing.assert_almost_equal(torch_dA2, triton_dA2)
+    triton.testing.assert_almost_equal(torch_dz1, triton_dz1)
     triton.testing.assert_almost_equal(torch_dz2, triton_dz2)
-    # triton.testing.assert_almost_equal(torch_dz1, triton_dz1)
+
+    torch_dW1_computed = torch.matmul(torch_dz1.T, x).T
+    torch_dW1, torch_dW2 = torch.chunk(torch_grad, 2, dim=1)
+    triton.testing.assert_almost_equal(torch_dW1, torch_dW1_computed)
+
+    triton_dW1_computed = torch.matmul(triton_dz1.T, x).T
+    # precision lossiness reduces the degree to which our results are identical
+    # so reduce the precision of the comparison to 1 decimal
+    triton.testing.assert_almost_equal(triton_dW1_computed, torch_dW1, decimal=1)
+
+    triton.testing.assert_almost_equal(torch_dW1, triton_dW1, decimal=1)
+    triton.testing.assert_almost_equal(torch_dW2, triton_dW2, decimal=1)
+    triton_dW_computed = torch.concat((triton_dW1, triton_dW2), dim=1)
+    triton.testing.assert_almost_equal(torch_grad, triton_dW_computed, decimal=1)
 
 
 if __name__ == "__main__":
