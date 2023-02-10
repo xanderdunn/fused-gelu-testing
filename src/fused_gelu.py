@@ -113,13 +113,13 @@ def gelu_partial_layer_fused_backward(
         tl.store(dz1_ptr + offsets, dz1)
         offsets += BLOCK_SIZE_M * stride_dA_half_m
 
-    dW1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    dW2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # dW1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # dW2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # TODO: Do the matmul for dW1 and dW2, how to handle the different block sizes?
 
 @triton.jit
 def gelu_partial_layer_fused_backward_matmul(
-        dz1_ptr, b_ptr, dz2_ptr, c_ptr, dW2_ptr,
+        dz1_ptr, b_ptr, dz2_ptr, dW1_ptr, dW2_ptr,
         M, N, K,
         stride_am, stride_ak,
         stride_bk, stride_bn,
@@ -151,6 +151,9 @@ def gelu_partial_layer_fused_backward_matmul(
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # Regular: ptrs = base + i[:, None]*stride_i + j[None, :]
+    # Transposed: ptrs = base + i[:, None] + j[None, :]*stride_j
+    # Transposed: ptrs = base + i[:, None]*stride_i + j[None, :]*stride_j, Compiler will figure it out if one of stride_i or stride_j is 1
     dz1_ptrs = dz1_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     dz2_ptrs = dz2_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
@@ -177,7 +180,7 @@ def gelu_partial_layer_fused_backward_matmul(
         dz1_ptrs += BLOCK_SIZE_K * stride_ak
         dz2_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
-    c = accumulator_dW1.to(tl.float16)
+    dW1 = accumulator_dW1.to(tl.float16)
     dW2 = accumulator_dW2.to(tl.float16)
 
     # -----------------------------------------------------------
@@ -188,8 +191,9 @@ def gelu_partial_layer_fused_backward_matmul(
     out_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(dW2_ptrs, dW2, mask=out_mask)
 
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    tl.store(c_ptrs, c, mask=out_mask)
+    # Transpose
+    dW1_ptrs = dW1_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    tl.store(dW1_ptrs, dW1, mask=out_mask)
 
 @triton.jit
 def gelu_fast(x):
@@ -307,11 +311,9 @@ class PartialGeluLayer(torch.autograd.Function):
         triton_dA2 = dA2
         triton_dz1 = dz1
         triton_dz2 = dz2
-        dz1 = dz1.T
-        dz2 = dz2.T
-        assert(dz1.shape[1] == x.shape[0])
-        assert(dz1.shape == dz2.shape)
-        M, K = dz1.shape
+        assert(dz1.T.shape[1] == x.shape[0])
+        assert(dz1.T.shape == dz2.T.shape)
+        M, K = dz1.T.shape
         K, N = x.shape
         dW1 = torch.zeros(M, N, device=x.device, dtype=x.dtype)
         dW2 = torch.zeros(M, N, device=x.device, dtype=x.dtype)
@@ -319,7 +321,7 @@ class PartialGeluLayer(torch.autograd.Function):
         gelu_partial_layer_fused_backward_matmul[grid](
             dz1, x, dz2, dW1, dW2,
             M, N, K,
-            dz1.stride(0), dz1.stride(1),
+            dz1.T.stride(0), dz1.T.stride(1),
             x.stride(0), x.stride(1),
             dW1.stride(0), dW1.stride(1),
             BLOCK_SIZE_M=32, # type: ignore
@@ -327,8 +329,8 @@ class PartialGeluLayer(torch.autograd.Function):
             BLOCK_SIZE_K=16, # type: ignore
             GROUP_SIZE_M=8, # type: ignore
         )
-        triton_dW1 = dW1.T
-        triton_dW2 = dW2.T
+        triton_dW1 = dW1
+        triton_dW2 = dW2
         return None, dW
 
 
@@ -404,9 +406,9 @@ def main():
     # so reduce the precision of the comparison to 1 decimal
     triton.testing.assert_almost_equal(triton_dW1_computed, torch_dW1, decimal=1)
 
-    triton.testing.assert_almost_equal(torch_dW1, triton_dW1, decimal=1)
-    triton.testing.assert_almost_equal(torch_dW2, triton_dW2, decimal=1)
-    triton_dW_computed = torch.concat((triton_dW1, triton_dW2), dim=1)
+    triton.testing.assert_almost_equal(torch_dW1.T, triton_dW1, decimal=1)
+    triton.testing.assert_almost_equal(torch_dW2.T, triton_dW2, decimal=1)
+    triton_dW_computed = torch.concat((triton_dW1.T, triton_dW2.T), dim=1)
     triton.testing.assert_almost_equal(torch_grad, triton_dW_computed, decimal=1)
 
 
