@@ -84,7 +84,7 @@ def gelu_partial_layer_fused_forward(
 
 @triton.jit
 def gelu_partial_layer_fused_backward(
-        x_ptr, W_ptr, z1_ptr, z2_ptr, dA_ptr, dW_ptr, dA1_ptr, dA2_ptr, dz1_ptr, dz2_ptr,
+        x_ptr, W_ptr, z1_ptr, z2_ptr, dA_ptr, dW_ptr, dA1_ptr, dA2_ptr, dz1_ptr, dz2_ptr, dW1_ptr, dW2_ptr,
         M, N,
         stride_dA_half_m,
         BLOCK_SIZE_M: tl.constexpr,
@@ -113,86 +113,69 @@ def gelu_partial_layer_fused_backward(
         tl.store(dz1_ptr + offsets, dz1)
         offsets += BLOCK_SIZE_M * stride_dA_half_m
 
-    # dW1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    # dW2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    dW1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    dW2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # TODO: Do the matmul for dW1 and dW2, how to handle the different block sizes?
 
 @triton.jit
 def gelu_partial_layer_fused_backward_matmul(
         dz1_ptr, b_ptr, dz2_ptr, dW1_ptr, dW2_ptr,
-        M, N, K,
-        stride_am, stride_ak,
-        stride_bk, stride_bn,
-        stride_cm, stride_cn,
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-      GROUP_SIZE_M: tl.constexpr,
+        P, R, Q,
+        stride_dzm, stride_dzk,
+        stride_xk, stride_xn,
+        stride_Wm, stride_Wn,
+        BLOCK_SIZE_P: tl.constexpr,
+        BLOCK_SIZE_R: tl.constexpr,
+        BLOCK_SIZE_Q: tl.constexpr,
+        GROUP_SIZE_P: tl.constexpr,
         ):
-          # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse
-    # See above `L2 Cache Optimizations` section for details
+    # L2 Cache Optimizations
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    num_pid_m = tl.cdiv(P, BLOCK_SIZE_P)
+    num_pid_n = tl.cdiv(R, BLOCK_SIZE_R)
+    num_pid_in_group = GROUP_SIZE_P * num_pid_n
     group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    first_pid_m = group_id * GROUP_SIZE_P
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_P)
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # a_ptrs is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # b_ptrs is a block of [BLOCK_SIZE_K, BLOCK_SIZE_n] pointers
-    # see above `Pointer Arithmetics` section for details
-    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # Create pointers for the first blocks
+    offs_dzm = pid_m * BLOCK_SIZE_P + tl.arange(0, BLOCK_SIZE_P)
+    offs_xn = pid_n * BLOCK_SIZE_R + tl.arange(0, BLOCK_SIZE_R)
+    offs_k = tl.arange(0, BLOCK_SIZE_Q)
     # Regular: ptrs = base + i[:, None]*stride_i + j[None, :]
     # Transposed: ptrs = base + i[:, None] + j[None, :]*stride_j
     # Transposed: ptrs = base + i[:, None]*stride_i + j[None, :]*stride_j, Compiler will figure it out if one of stride_i or stride_j is 1
-    dz1_ptrs = dz1_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    dz2_ptrs = dz2_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    dz1_ptrs = dz1_ptr + (offs_dzm[:, None] * stride_dzm + offs_k[None, :] * stride_dzk)
+    dz2_ptrs = dz2_ptr + (offs_dzm[:, None] * stride_dzm + offs_k[None, :] * stride_dzk)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_xk + offs_xn[None, :] * stride_xn)
 
-    # -----------------------------------------------------------
-    # Iterate to compute a block of the C matrix
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop
-    accumulator_dW1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    accumulator_dW2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, K, BLOCK_SIZE_K):
-        # Note that for simplicity, we don't apply a mask here.
-        # This means that if K is not a multiple of BLOCK_SIZE_K,
-        # this will access out-of-bounds memory and produce an
-        # error or (worse!) incorrect results.
+    # Iterate to compute a block of the dW1 and dW2 matrices
+    accumulator_dW1 = tl.zeros((BLOCK_SIZE_P, BLOCK_SIZE_R), dtype=tl.float32)
+    accumulator_dW2 = tl.zeros((BLOCK_SIZE_P, BLOCK_SIZE_R), dtype=tl.float32)
+    for k in range(0, Q, BLOCK_SIZE_Q):
         dz1 = tl.load(dz1_ptrs)
         b = tl.load(b_ptrs)
         dz2 = tl.load(dz2_ptrs)
-        # We accumulate along the K dimension
         accumulator_dW1 += tl.dot(dz1, b)
         accumulator_dW2 += tl.dot(dz2, b)
-        # Advance the ptrs to the next K block
-        dz1_ptrs += BLOCK_SIZE_K * stride_ak
-        dz2_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        dz1_ptrs += BLOCK_SIZE_Q * stride_dzk
+        dz2_ptrs += BLOCK_SIZE_Q * stride_dzk
+        b_ptrs += BLOCK_SIZE_Q * stride_xk
     dW1 = accumulator_dW1.to(tl.float16)
     dW2 = accumulator_dW2.to(tl.float16)
 
     # -----------------------------------------------------------
-    # Write back the block of the output matrix C
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    dW2_ptrs = dW2_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    out_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    # Write back the block of the output matrix dW1 and dW2
+    offs_Wm = pid_m * BLOCK_SIZE_P + tl.arange(0, BLOCK_SIZE_P)
+    offs_Wn = pid_n * BLOCK_SIZE_R + tl.arange(0, BLOCK_SIZE_R)
+    dW2_ptrs = dW2_ptr + stride_Wm * offs_Wm[:, None] + stride_Wn * offs_Wn[None, :]
+    out_mask = (offs_Wm[:, None] < P) & (offs_Wn[None, :] < R)
     tl.store(dW2_ptrs, dW2, mask=out_mask)
 
     # Transpose
-    dW1_ptrs = dW1_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    dW1_ptrs = dW1_ptr + stride_Wm * offs_Wm[:, None] + stride_Wn * offs_Wn[None, :]
     tl.store(dW1_ptrs, dW1, mask=out_mask)
 
 @triton.jit
@@ -290,15 +273,37 @@ class PartialGeluLayer(torch.autograd.Function):
         dA2 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
         dz1 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
         dz2 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
+        P, Q = dz1.T.shape
+        Q, R = x.shape
+        dW1 = torch.zeros(P, R, device=x.device, dtype=x.dtype)
+        dW2 = torch.zeros(P, R, device=x.device, dtype=x.dtype)
+        dW = torch.zeros(P, R * 2, device=x.device, dtype=x.dtype)
         grid = lambda META: (
                 triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+                # triton.cdiv(P, META['BLOCK_SIZE_P']) * triton.cdiv(R, META['BLOCK_SIZE_R']),
                 )
         gelu_partial_layer_fused_backward[grid](
-                x, W, z1, z2, dA, dW, dA1, dA2, dz1, dz2,
+                x, W, z1, z2, dA, dW, dA1, dA2, dz1, dz2, dW1, dW2,
                 M, N,
                 stride_dA_half_m=dA1.stride(0),
                 BLOCK_SIZE_M=32,
                 BLOCK_SIZE_N=32, # type: ignore
+        )
+        assert(dz1.T.shape[1] == x.shape[0])
+        assert(dz1.T.shape == dz2.T.shape)
+        grid = lambda META: (
+                triton.cdiv(P, META['BLOCK_SIZE_P']) * triton.cdiv(R, META['BLOCK_SIZE_R']),
+                )
+        gelu_partial_layer_fused_backward_matmul[grid](
+            dz1, x, dz2, dW1, dW2,
+            P, R, Q,
+            dz1.T.stride(0), dz1.T.stride(1),
+            x.stride(0), x.stride(1),
+            dW1.stride(0), dW1.stride(1),
+            BLOCK_SIZE_P=32, # type: ignore
+            BLOCK_SIZE_R=32, # type: ignore
+            BLOCK_SIZE_Q=16, # type: ignore
+            GROUP_SIZE_P=8, # type: ignore
         )
         # For debugging: Store the outputs to compare to pytorch
         global triton_dA1
@@ -311,24 +316,6 @@ class PartialGeluLayer(torch.autograd.Function):
         triton_dA2 = dA2
         triton_dz1 = dz1
         triton_dz2 = dz2
-        assert(dz1.T.shape[1] == x.shape[0])
-        assert(dz1.T.shape == dz2.T.shape)
-        M, K = dz1.T.shape
-        K, N = x.shape
-        dW1 = torch.zeros(M, N, device=x.device, dtype=x.dtype)
-        dW2 = torch.zeros(M, N, device=x.device, dtype=x.dtype)
-        dW = torch.zeros(M, N * 2, device=x.device, dtype=x.dtype)
-        gelu_partial_layer_fused_backward_matmul[grid](
-            dz1, x, dz2, dW1, dW2,
-            M, N, K,
-            dz1.T.stride(0), dz1.T.stride(1),
-            x.stride(0), x.stride(1),
-            dW1.stride(0), dW1.stride(1),
-            BLOCK_SIZE_M=32, # type: ignore
-            BLOCK_SIZE_N=32, # type: ignore
-            BLOCK_SIZE_K=16, # type: ignore
-            GROUP_SIZE_M=8, # type: ignore
-        )
         triton_dW1 = dW1
         triton_dW2 = dW2
         return None, dW
