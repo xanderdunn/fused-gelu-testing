@@ -3,6 +3,7 @@
 import torch
 import triton
 import triton.language as tl
+import numpy as np
 
 @triton.jit
 def gelu_partial_layer_fused_forward(
@@ -37,14 +38,14 @@ def gelu_partial_layer_fused_forward(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Create pointers for the first blocks of A and B.
-    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    # Create pointers for the first blocks of x and W.
+    offs_xm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_Wn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    x_ptrs = x_ptr + (offs_am[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    W_left_ptrs = W_ptr + (offs_k[:, None] * stride_Wk + offs_bn[None, :] * stride_Wn)
+    x_ptrs = x_ptr + (offs_xm[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+    W_left_ptrs = W_ptr + (offs_k[:, None] * stride_Wk + offs_Wn[None, :] * stride_Wn)
     # offset the start by half of the number of columns
-    W_right_ptrs = W_ptr + (N // 2) + (offs_k[:, None] * stride_Wk + offs_bn[None, :] * stride_Wn)
+    W_right_ptrs = W_ptr + (N // 2) + (offs_k[:, None] * stride_Wk + offs_Wn[None, :] * stride_Wn)
 
     z1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     z2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -67,12 +68,11 @@ def gelu_partial_layer_fused_forward(
     # Store z1 in z1_ptr
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    z1_ptrs = z1_ptr + stride_Am * offs_cm[:, None] + stride_An * offs_cn[None, :]
+    offsets = stride_Am * offs_cm[:, None] + stride_An * offs_cn[None, :]
     outs_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N // 2)
-    tl.store(z1_ptrs, z1, mask=outs_mask)
+    tl.store(z1_ptr + offsets, z1, mask=outs_mask)
     # Store z2 in z2_ptr
-    z2_ptrs = z2_ptr + stride_Am * offs_cm[:, None] + stride_An * offs_cn[None, :]
-    tl.store(z2_ptrs, z2, mask=outs_mask)
+    tl.store(z2_ptr + offsets, z2, mask=outs_mask)
 
     # Element-wise multiply of z1 and gelu(z2)
     z2 = gelu_fast(z2)
@@ -80,12 +80,11 @@ def gelu_partial_layer_fused_forward(
     c = c.to(tl.float16)
 
     # Write back the block of the output matrix C
-    A_ptrs = A_ptr + stride_Am * offs_cm[:, None] + stride_An * offs_cn[None, :]
-    tl.store(A_ptrs, c, mask=outs_mask)
+    tl.store(A_ptr + offsets, c, mask=outs_mask)
 
 @triton.jit
 def gelu_partial_layer_fused_backward(
-        x_ptr, W_ptr, z1_ptr, z2_ptr, dA_ptr, dW_ptr, dA1_ptr, dA2_ptr,
+        x_ptr, W_ptr, z1_ptr, z2_ptr, dA_ptr, dW_ptr, dA1_ptr, dA2_ptr, dz1_ptr, dz2_ptr,
         M, N,
         stride_dA_half_m,
         BLOCK_SIZE_M: tl.constexpr,
@@ -95,29 +94,28 @@ def gelu_partial_layer_fused_backward(
     block_start = pid * BLOCK_SIZE_M
     offsets = block_start + tl.arange(0, BLOCK_SIZE_M)
 
+    # These operations can be done in blocks by row
+    dz1 = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.float32)
+    dz2 = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.float32)
     offsets = block_start + tl.arange(0, BLOCK_SIZE_M)
     for _ in range(0, M, BLOCK_SIZE_M):
         dA = tl.load(dA_ptr + offsets)
         z1 = tl.load(z1_ptr + offsets)
         z2 = tl.load(z2_ptr + offsets)
         dA1 = dA * gelu_fast(z2)
+        dz1 += dA1 # TODO: Is this accumulating as expected?
+
         dA2 = dA * z1
+        dz2_piece = dA2 * gelu_fast_prime(z2)
+        dz2 += dz2_piece
         tl.store(dA1_ptr + offsets, dA1)
         tl.store(dA2_ptr + offsets, dA2)
+        tl.store(dz2_ptr + offsets, dz2_piece)
         offsets += BLOCK_SIZE_M * stride_dA_half_m
-    # dA1 = dA * gelu(z2)
-    # dz1 = dA1 # there's no activation function on this half
-    # dW1 = np.matmul(dz1.T, x).T
 
-    # dA2 = dA * z1
-    # dz2 = dA2 * gelu_prime(z2)
-    # dW2 = np.matmul(dz2.T, x).T
-
-    # dW = np.concatenate((dW1, dW2), axis=1)
-
-    # Do a for-loop element-wise multiply and accumulate dA1 and dA2
-    # Do a for-loop matmul and accumulate dW1 and dW2
-    pass
+    dW1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    dW2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # TODO: Do the matmul for dW1 and dW2, how to handle the different block sizes?
 
 @triton.jit
 def gelu_fast(x):
@@ -129,6 +127,17 @@ def gelu_fast(x):
     return (
             0.5 * x * (1.0 + tl.libdevice.tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x)))
            )
+
+# From https://github.com/MarkTigchelaar/Tinman/blob/27a492c06105d550d7eacd2ca9fadc089d484c3a/src/neural_network_parts/activator.rs#L232
+# In my testing this is a close approximation but not exact match of the backward pass of the pytorch GELU()
+def gelu_prime(x: np.ndarray) -> np.ndarray:
+    term1 = 0.0356774 * x * x * x;
+    term2 = 0.398942 * x;
+    term3 = 0.797885 * x;
+    term4 = 0.0535161  * x * x * x;
+    hyp_secant = 1 / np.cosh(term1 + term3);
+    hyp_secant *= hyp_secant;
+    return 0.5 * np.tanh(term1 + term3) + (term4 + term2) * hyp_secant + 0.5
 
 @triton.jit
 def gelu_fast_prime(x):
@@ -148,6 +157,8 @@ triton_z1 = None
 triton_z2 = None
 triton_dA1 = None
 triton_dA2 = None
+triton_dz2 = None
+triton_dz1 = None
 
 class PartialGeluLayer(torch.autograd.Function):
 
@@ -197,11 +208,13 @@ class PartialGeluLayer(torch.autograd.Function):
         dW = torch.empty(W.shape, device=x.device, dtype=x.dtype)
         dA1 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
         dA2 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
+        dz1 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
+        dz2 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
         grid = lambda META: (
                 triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
                 )
         gelu_partial_layer_fused_backward[grid](
-                x, W, z1, z2, dA, dW, dA1, dA2,
+                x, W, z1, z2, dA, dW, dA1, dA2, dz1, dz2,
                 M, N,
                 stride_dA_half_m=dA1.stride(0),
                 BLOCK_SIZE_M=32,
@@ -209,8 +222,12 @@ class PartialGeluLayer(torch.autograd.Function):
         )
         global triton_dA1
         global triton_dA2
+        global triton_dz1
+        global triton_dz2
         triton_dA1 = dA1
         triton_dA2 = dA2
+        triton_dz1 = dz1
+        triton_dz2 = dz2
         return None, dW
 
 
@@ -271,8 +288,13 @@ def main():
     # Test that the individual components of the backward pass are correct
     torch_dA1 = dA * torch_nn.gelu(torch_z2)
     torch_dA2 = dA * torch_z1
+    torch_dz1 = torch_dA1
+    torch_dz2 = torch_dA2.detach().cpu().numpy() * gelu_prime(torch_z2.detach().cpu().numpy())
+    # print(f"triton_dz1 = {triton_dz1}")
     triton.testing.assert_almost_equal(torch_dA1, triton_dA1)
     triton.testing.assert_almost_equal(torch_dA2, triton_dA2)
+    triton.testing.assert_almost_equal(torch_dz2, triton_dz2)
+    # triton.testing.assert_almost_equal(torch_dz1, triton_dz1)
 
 
 if __name__ == "__main__":
