@@ -3,7 +3,7 @@ Implement a fused GELU layer in triton. In pytorch this looks something like thi
 ```python
 def forward(self,
             x: torch.Tensor # [Batch, d_model]
-            ) -> torch.Tensor:
+           ) -> torch.Tensor:
     x = self.linear(x) # linear laying mapping d_model to 8 * d_model
     x1, x2 = x.chunk(2, dim=(x.ndim -1))
     return x1 * gelu_fast(x2)
@@ -21,7 +21,8 @@ After setup below, run the fused GELU with `./src/fused_gelu.py`
 ### TODO
 - Run benchmark against pytorch to see that the fused kernel offers performance improvement
 - Add the bias addition to the fused gelu forward kernel
-- Implement the backprop
+- The backprop is currently two kernels in serial. Combine them into a single kernel
+- The backprop kernel does not concatenation dW1 and dW2 into a single dW and it should
 
 ### Setup
 - Locally install the gcloud command line interface: `brew install gcloud`, this assumes you already have Homebrew installed on your local Mac
