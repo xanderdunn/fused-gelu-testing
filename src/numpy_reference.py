@@ -4,14 +4,20 @@ import torch
 import numpy as np
 import triton
 
+"""
+This is a reference implementation of the desired forward and backward passes in numpy
+with correctness testing against the pytorch implementation.
 
-# Useful pieces:
-# https://towardsdatascience.com/lets-code-a-neural-network-in-plain-numpy-ae7e74410795
-# https://medium.com/analytics-vidhya/neural-network-mnist-classifier-from-scratch-using-numpy-library-94bbcfed7eae
-# https://cs231n.github.io/optimization-2/
-# https://stackoverflow.com/questions/57248777/backward-function-in-pytorch
-# https://towardsdatascience.com/gradient-descent-from-scratch-e8b75fa986cc
-# https://goodboychan.github.io/python/datacamp/deep_learning/2020/07/21/02-Optimizing-a-neural-network-with-backward-propagation.html
+Useful pieces:
+https://towardsdatascience.com/lets-code-a-neural-network-in-plain-numpy-ae7e74410795
+https://medium.com/analytics-vidhya/neural-network-mnist-classifier-from-scratch-using-numpy-library-94bbcfed7eae
+https://cs231n.github.io/optimization-2/
+https://stackoverflow.com/questions/57248777/backward-function-in-pytorch
+https://towardsdatascience.com/gradient-descent-from-scratch-e8b75fa986cc
+https://goodboychan.github.io/python/datacamp/deep_learning/2020/07/21/02-Optimizing-a-neural-network-with-backward-propagation.html
+"""
+
+
 
 def relu(x):
     return np.maximum(0, x)
