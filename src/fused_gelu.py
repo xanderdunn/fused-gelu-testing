@@ -174,6 +174,7 @@ def gelu_partial_layer_fused_backward_matmul(
     # Transpose
     dW1_ptrs = dW1_ptr + stride_Wm * offs_Wm[:, None] + stride_Wn * offs_Wn[None, :]
     tl.store(dW1_ptrs, dW1, mask=out_mask)
+    # TODO: Store the transpose of dW1 and dW2 into the same dW output tensor
 
 @triton.jit
 def gelu_fast(x):
