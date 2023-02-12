@@ -17,6 +17,7 @@ This again compares favorably to the absolute values of [the same benchmark in t
 
 #### Forward
 This is the forward pass of pytorch and triton.
+
 ![partial gelu forward performance](partial-gelu-forward-performance.png "Vector element-wise performance")
 
 
