@@ -5,7 +5,23 @@ import triton
 import triton.language as tl
 import numpy as np
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
+# FIXME: This can produce a CUDA illegal access out of bounds error if d_model and batch_size aren't a power of 2
 def gelu_partial_layer_fused_forward(
         # Pointers to matrices
         x_ptr, W_ptr, A_ptr, z1_ptr, z2_ptr,
@@ -185,7 +201,7 @@ def gelu_fast(x):
             0.5 * x * (1.0 + tl.libdevice.tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x)))
            )
 
-# This is used solely for debugging
+# This is used solely for debugging and correctness testing
 def gelu_prime(x: np.ndarray) -> np.ndarray:
     """
     From https://github.com/MarkTigchelaar/Tinman/blob/27a492c06105d550d7eacd2ca9fadc089d484c3a/src/neural_network_parts/activator.rs#L232
@@ -253,17 +269,17 @@ class PartialGeluLayer(torch.autograd.Function):
             x.stride(0), x.stride(1),
             W.stride(0), W.stride(1),
             A.stride(0), A.stride(1),
-            # TODO: In production we would not want to hardcode these, but likely want to
+            # In production we would not want to hardcode these, but likely want to
             # find them via triton's autotuner.
-            BLOCK_SIZE_M=32, # type: ignore
-            BLOCK_SIZE_N=32, # type: ignore
-            BLOCK_SIZE_K=16, # type: ignore
-            GROUP_SIZE_M=8, # type: ignore
+            # BLOCK_SIZE_M=32, # type: ignore
+            # BLOCK_SIZE_N=64, # type: ignore
+            # BLOCK_SIZE_K=16, # type: ignore
+            # GROUP_SIZE_M=8, # type: ignore
         )
-        global triton_z1
-        global triton_z2
-        triton_z1 = z1
-        triton_z2 = z2
+        # global triton_z1
+        # global triton_z2
+        # triton_z1 = z1
+        # triton_z2 = z2
         ctx.save_for_backward(x, W, z1, z2)
         return A
 
@@ -335,7 +351,7 @@ class TorchNN():
 
 partial_gelu = PartialGeluLayer.apply
 
-def main():
+def check_correctness():
     print("Linear layer -> split in two by column -> GELU on the second half -> element-wise multiply of the first and second halves")
     print("In both pytorch and triton to compare correctness...")
     sizes = [2**i for i in range(6, 12)]
@@ -403,6 +419,48 @@ def main():
         triton.testing.assert_almost_equal(torch_grad, triton_dW, decimal=1)
         print(f"Backward ({size}, {size}): ✅ Triton and Torch match\n")
         # TODO: Benchmark the two implementations across increasing sizes of matrices
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['size'],  # argument names to use as an x-axis for the plot
+        x_vals = [2**i for i in range(5, 13)],
+        # x_vals=[
+            # 128 * i for i in range(2, 33)
+        # ],  # different possible values for `x_name`
+        line_arg='provider',  # argument name whose value corresponds to a different line in the plot
+        # possible values for `line_arg``
+        line_vals=['pytorch', 'triton'],
+        # label name for the lines
+        line_names=["PyTorch", "Triton"],
+        # line styles
+        styles=[('green', '-'), ('blue', '-')],
+        ylabel="TFLOPS",  # label name for the y-axis
+        plot_name="partial-gelu-performance",  # name for the plot. Used also as a file name for saving the plot.
+        args={"mode": "forward"},
+    )
+)
+
+
+def benchmark(size, provider: str, mode: str):
+    print(f"{provider} benchmarking on ({size}, {size})...")
+    torch_nn = TorchNN(size)
+    linear_weights = torch_nn.linear.state_dict()["weight"].T.contiguous()
+    x = torch.randn((size, size), device='cuda', dtype=torch.float16)
+    if provider == 'pytorch':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch_nn.forward(x))
+    if provider == 'triton':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: partial_gelu(x, linear_weights))
+    perf = lambda ms: 2 * size * size * size  * 1e-12 / (ms * 1e-3)
+    return perf(ms), perf(max_ms), perf(min_ms)
+
+def run_benchmarks():
+    print("Running benchmark...")
+    benchmark.run(print_data=True, save_path="./")
+
+
+def main():
+    # check_correctnes()
+    run_benchmarks()
 
 
 if __name__ == "__main__":
