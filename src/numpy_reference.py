@@ -87,6 +87,8 @@ class TorchNN():
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         Z = self.linear(x)
+        assert not torch.isnan(Z).any()
+        assert not torch.isinf(Z).any()
         z1, z2 = torch.chunk(Z, 2, dim=1)
         A = z1 * self.gelu(z2)
         return A
@@ -96,31 +98,38 @@ def main():
     torch.manual_seed(0)
     np.random.seed(0)
 
-    d_model = 8
-    batch_size = 4
-    x = torch.randn(batch_size, d_model, device='cpu')  # input
+    sizes = [2**i for i in range(6, 12)]
+    print(f"sizes = {sizes}")
+    for size in sizes:
+        d_model = size
+        batch_size = size
+        x = torch.randn(batch_size, d_model, device='cpu')  # input
 
-    # PyTorch
-    torch_nn = TorchNN(d_model)
-    torch_forward = torch_nn.forward(x)
-    # This is dA, or some upstream gradient that we must backpropagate
-    grad = torch.randn(batch_size, d_model * 8 // 2, device='cpu')
-    torch_forward.backward(grad)
-    torch_grad = torch_nn.linear.weight.grad
-    assert torch_grad is not None
-    torch_grad = torch_grad.T
+        # PyTorch
+        torch_nn = TorchNN(d_model)
+        torch_forward = torch_nn.forward(x)
+        # This is dA, or some upstream gradient that we must backpropagate
+        grad = torch.randn(batch_size, d_model * 8 // 2, device='cpu')
+        torch_forward.backward(grad)
+        torch_grad = torch_nn.linear.weight.grad
+        assert torch_grad is not None
+        assert not torch.isnan(torch_grad).any()
+        assert not torch.isinf(torch_grad).any()
+        torch_grad = torch_grad.T
 
-    # Numpy
-    W = torch_nn.linear.state_dict()["weight"].T
-    assert torch_grad.shape == W.shape
-    numpy_nn = NumpyNN(W.detach().numpy())
-    numpy_forward = numpy_nn.forward(x.detach().numpy())
-    numpy_grad = numpy_nn.backward(x.detach().numpy(), grad.detach().numpy())
-    assert numpy_grad.shape == W.shape
+        # Numpy
+        W = torch_nn.linear.state_dict()["weight"].T
+        assert torch_grad.shape == W.shape
+        numpy_nn = NumpyNN(W.detach().numpy())
+        numpy_forward = numpy_nn.forward(x.detach().numpy())
+        numpy_grad = numpy_nn.backward(x.detach().numpy(), grad.detach().numpy())
+        assert numpy_grad.shape == W.shape
+        assert not np.isnan(numpy_grad).any()
+        assert not np.isinf(numpy_grad).any()
 
-    triton.testing.assert_almost_equal(torch_forward.detach().numpy(), numpy_forward)
-    triton.testing.assert_almost_equal(torch_grad, numpy_grad)
-    print("Success!")
+        triton.testing.assert_almost_equal(torch_forward.detach().numpy(), numpy_forward)
+        triton.testing.assert_almost_equal(torch_grad, numpy_grad, decimal=1)
+        print(f"({size}, {size}) Success!")
 
 
 if __name__ == "__main__":
