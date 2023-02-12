@@ -18,10 +18,13 @@ This again compares favorably to the absolute values of [the same benchmark in t
 #### Forward
 This is the forward pass of pytorch and triton.
 
-![partial gelu forward performance](partial-gelu-forward-performance.png "Vector element-wise performance")
+![partial gelu forward performance](partial-gelu-forward-performance.png "Partial gelu forward performance")
 
-
-It's unfortunate that the triton performance here is considerably worse than the pytorch performance. I wonder if it is related to [this](https://github.com/openai/triton/issues/984) issue where the author notes that having two accumulators in the same matmul kernel breaks performance. 
+It's unfortunate that the triton performance here is considerably worse than the pytorch performance. I wonder if it is related to [this](https://github.com/openai/triton/issues/984) issue where the author notes that having two accumulators in the same matmul kernel breaks performance. In the forward pass I'm accumulating the left side into `z1` and the right side into `z2`. While the triton benchmarks run, I see 100% GPU utilization in nvidia-smi, so it doesn't appear to be an issue with loading data or Python computation.
 
 #### Backward
-This is the backward pass of pytorch and the two triton kernels in serial (one days the element-wise computations and the second one does the matmuls).
+This is the backward pass of pytorch and the two triton kernels in serial. The first kernel does the element-wise computations and the second kernel does the matmuls.
+
+![partial gelu backward performance](partial-gelu-backward-performance.png "Partial gelu backward performance")
+
+Again the results are similarly worse than PyTorch. My current hunch is that it may be the same issue with having multiple accumulators in the matmul. In this case it is the accumulators for `dW1` and `dW2`. 

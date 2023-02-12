@@ -116,8 +116,8 @@ def gelu_partial_layer_fused_backward(
 
     dA2 = dA * z1
     dz2 = dA2 * gelu_fast_prime(z2)
-    tl.store(dA1_ptr + offsets, dA1)
-    tl.store(dA2_ptr + offsets, dA2)
+    # tl.store(dA1_ptr + offsets, dA1)
+    # tl.store(dA2_ptr + offsets, dA2)
     tl.store(dz2_ptr + offsets, dz2)
     tl.store(dz1_ptr + offsets, dz1)
 
@@ -232,15 +232,15 @@ def gelu_fast_prime(x):
 # TODO: Remove these for production. 
 # These are for debugging only to check the values
 # against the pytorch reference implementation
-triton_z1 = None
-triton_z2 = None
-triton_dA1 = None
-triton_dA2 = None
-triton_dz2 = None
-triton_dz1 = None
+# triton_z1 = None
+# triton_z2 = None
+# triton_dA1 = None
+# triton_dA2 = None
+# triton_dz2 = None
+# triton_dz1 = None
 # triton_dW1 = None
 # triton_dW2 = None
-triton_dW = None
+# triton_dW = None
 
 class PartialGeluLayer(torch.autograd.Function):
 
@@ -320,16 +320,16 @@ class PartialGeluLayer(torch.autograd.Function):
         )
         # TODO: Remove for production. This is for debugging only:
         # Store the outputs to compare to pytorch
-        global triton_dA1
-        global triton_dA2
-        global triton_dz1
-        global triton_dz2
-        global triton_dW
-        triton_dA1 = dA1
-        triton_dA2 = dA2
-        triton_dz1 = dz1
-        triton_dz2 = dz2
-        triton_dW = dW
+        # global triton_dA1
+        # global triton_dA2
+        # global triton_dz1
+        # global triton_dz2
+        # global triton_dW
+        # triton_dA1 = dA1
+        # triton_dA2 = dA2
+        # triton_dz1 = dz1
+        # triton_dz2 = dz2
+        # triton_dW = dW
         return None, dW
 
 
@@ -436,20 +436,28 @@ def check_correctness():
         styles=[('green', '-'), ('blue', '-')],
         ylabel="TFLOPS",  # label name for the y-axis
         plot_name="partial-gelu-performance",  # name for the plot. Used also as a file name for saving the plot.
-        args={"mode": "forward"},
+        args={"mode": "backward"},
     )
 )
 
 
 def benchmark(size, provider: str, mode: str):
-    print(f"{provider} benchmarking on ({size}, {size})...")
+    print(f"{provider} benchmarking {mode} pass on ({size}, {size})...")
     torch_nn = TorchNN(size)
     linear_weights = torch_nn.linear.state_dict()["weight"].T.contiguous()
     x = torch.randn((size, size), device='cuda', dtype=torch.float16)
     if provider == 'pytorch':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch_nn.forward(x))
+        forward_f = lambda: torch_nn.forward(x)
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: partial_gelu(x, linear_weights))
+        forward_f = lambda: partial_gelu(x, linear_weights)
+    if mode == "forward":
+        ms, min_ms, max_ms = triton.testing.do_bench(forward_f)
+    if mode == "backward":
+        x.requires_grad_(True)
+        forward = forward_f()
+        dA = torch.randn(size, size * 8 // 2, device=x.device, dtype=x.dtype)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: forward.backward(dA, retain_graph=True))
+    # TODO: This perf function should be better estimated for the forward and backward passes
     perf = lambda ms: 2 * size * size * size  * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
