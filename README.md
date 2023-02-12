@@ -22,7 +22,6 @@ After setup below, run the fused GELU with `./src/fused_gelu.py`
 - Run benchmark against pytorch to see that the fused kernel offers performance improvement
 - Add the bias addition to the fused gelu forward kernel
 - The backprop is currently two kernels in serial. Combine them into a single kernel
-- The backprop kernel does not concatenation dW1 and dW2 into a single dW and it should
 
 ### Setup
 - Locally install the gcloud command line interface: `brew install gcloud`, this assumes you already have Homebrew installed on your local Mac
