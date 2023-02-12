@@ -318,11 +318,15 @@ class TorchNN():
         # TODO: Add the bias back once the bias addition is added to the triton kernel
         self.linear = torch.nn.Linear(d_model, 8 * d_model, device='cuda', dtype=torch.float16, bias=False)
         self.gelu = torch.nn.GELU()
+        self.z1: torch.Tensor | None = None
+        self.z2: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.linear(x)
-        x1, x2 = x.chunk(2, dim=(x.ndim - 1))
-        result = x1 * self.gelu(x2)
+        Z = self.linear(x)
+        z1, z2 = torch.chunk(Z, 2, dim=(Z.ndim - 1))
+        self.z1 = z1
+        self.z2 = z2
+        result = z1 * self.gelu(z2)
         return result
 
 partial_gelu = PartialGeluLayer.apply
@@ -346,10 +350,13 @@ def main():
         triton_forward = partial_gelu(x, linear_weights)
 
         # Test that the portions of Z were stored correctly for retrieval by the backward pass
-        Z = torch_nn.linear(x)
-        torch_z1, torch_z2 = torch.chunk(Z, 2, dim=1)
-        triton.testing.assert_almost_equal(torch_z1, triton_z1)
-        triton.testing.assert_almost_equal(torch_z2, triton_z2)
+        assert torch_nn.z1 is not None
+        assert torch_nn.z2 is not None
+        assert not torch.isnan(torch_nn.z1).any()
+        assert not torch.isinf(torch_nn.z1).any()
+
+        triton.testing.assert_almost_equal(torch_nn.z1, triton_z1)
+        triton.testing.assert_almost_equal(torch_nn.z2, triton_z2)
 
         triton.testing.assert_almost_equal(triton_forward, torch_forward)
         print(f"Forward ({size}, {size}): ✅ Triton and Torch match")
@@ -363,10 +370,10 @@ def main():
         triton_grad = triton_forward.backward(dA)
 
         # Test that the individual components of the backward pass are correct
-        torch_dA1 = dA * torch_nn.gelu(torch_z2)
-        torch_dA2 = dA * torch_z1
+        torch_dA1 = dA * torch_nn.gelu(torch_nn.z2)
+        torch_dA2 = dA * torch_nn.z1
         torch_dz1 = torch_dA1
-        torch_dz2 = torch_dA2.detach().cpu().numpy() * gelu_prime(torch_z2.detach().cpu().numpy())
+        torch_dz2 = torch_dA2.detach().cpu().numpy() * gelu_prime(torch_nn.z2.detach().cpu().numpy())
 
         triton.testing.assert_almost_equal(torch_dA1, triton_dA1)
         triton.testing.assert_almost_equal(torch_dA2, triton_dA2)
