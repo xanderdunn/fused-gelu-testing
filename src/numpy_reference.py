@@ -82,7 +82,7 @@ class NumpyNN():
 class TorchNN():
 
     def __init__(self, d_model: int):
-        self.linear = torch.nn.Linear(d_model, d_model * 8, bias=False)
+        self.linear = torch.nn.Linear(d_model, d_model * 8, bias=False, device="cuda", dtype=torch.float16)
         self.gelu = torch.nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -103,13 +103,13 @@ def main():
     for size in sizes:
         d_model = size
         batch_size = size
-        x = torch.randn(batch_size, d_model, device='cpu')  # input
+        x = torch.randn((batch_size, d_model), device='cuda', dtype=torch.float16)  # input
 
         # PyTorch
         torch_nn = TorchNN(d_model)
         torch_forward = torch_nn.forward(x)
         # This is dA, or some upstream gradient that we must backpropagate
-        grad = torch.randn(batch_size, d_model * 8 // 2, device='cpu')
+        grad = torch.randn(batch_size, d_model * 8 // 2, device='cuda', dtype=torch.float16)
         torch_forward.backward(grad)
         torch_grad = torch_nn.linear.weight.grad
         assert torch_grad is not None
@@ -120,14 +120,14 @@ def main():
         # Numpy
         W = torch_nn.linear.state_dict()["weight"].T
         assert torch_grad.shape == W.shape
-        numpy_nn = NumpyNN(W.detach().numpy())
-        numpy_forward = numpy_nn.forward(x.detach().numpy())
-        numpy_grad = numpy_nn.backward(x.detach().numpy(), grad.detach().numpy())
+        numpy_nn = NumpyNN(W.detach().cpu().numpy())
+        numpy_forward = numpy_nn.forward(x.detach().cpu().numpy().astype(np.float32))
+        numpy_grad = numpy_nn.backward(x.detach().cpu().numpy().astype(np.float32), grad.detach().cpu().numpy().astype(np.float32))
         assert numpy_grad.shape == W.shape
         assert not np.isnan(numpy_grad).any()
         assert not np.isinf(numpy_grad).any()
 
-        triton.testing.assert_almost_equal(torch_forward.detach().numpy(), numpy_forward)
+        triton.testing.assert_almost_equal(torch_forward.detach().cpu().numpy(), numpy_forward)
         triton.testing.assert_almost_equal(torch_grad, numpy_grad, decimal=1)
         print(f"({size}, {size}) Success!")
 
