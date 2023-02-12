@@ -326,15 +326,17 @@ class TorchNN():
         z1, z2 = torch.chunk(Z, 2, dim=(Z.ndim - 1))
         self.z1 = z1
         self.z2 = z2
-        result = z1 * self.gelu(z2)
-        return result
+        A = z1 * self.gelu(z2)
+        return A
 
 partial_gelu = PartialGeluLayer.apply
 
 def main():
     print("Doing a forward pass: Linear layer -> split in two by column -> GELU on the second half -> element-wise multiply of the first and second halves")
     print("In both pytorch and triton to compare correctness...")
-    for size in [32, 64, 128, 512]:
+    sizes = [2**i for i in range(6, 12)]
+    print("sizes = ", sizes)
+    for size in sizes:
         batch_size = size # TODO: The backprop only works if this is square, where batch_size == d_model
         d_model = size
         torch.manual_seed(0)
@@ -342,27 +344,28 @@ def main():
         x = torch.randn((batch_size, d_model), device='cuda', dtype=torch.float16)
         x.requires_grad_(True)
 
+        # ptyroch
         torch_nn = TorchNN(d_model)
         torch_forward = torch_nn.forward(x)
+        assert torch_nn.z1 is not None
+        assert torch_nn.z2 is not None
+        assert not torch.isnan(torch_nn.z1).any()
+        assert not torch.isinf(torch_nn.z1).any()
+        # This is some arbitrary gradient passed from the previous layer
+        dA = torch.randn(batch_size, d_model * 8 // 2, device=x.device, dtype=x.dtype)
+        torch_forward.backward(dA)
 
         linear_weights = torch_nn.linear.state_dict()["weight"].T.contiguous()
         # biases = torch_nn.linear.state_dict()["bias"]
         triton_forward = partial_gelu(x, linear_weights)
 
         # Test that the portions of Z were stored correctly for retrieval by the backward pass
-        assert torch_nn.z1 is not None
-        assert torch_nn.z2 is not None
-        assert not torch.isnan(torch_nn.z1).any()
-        assert not torch.isinf(torch_nn.z1).any()
-
         triton.testing.assert_almost_equal(torch_nn.z1, triton_z1)
         triton.testing.assert_almost_equal(torch_nn.z2, triton_z2)
 
         triton.testing.assert_almost_equal(triton_forward, torch_forward)
         print(f"Forward ({size}, {size}): ✅ Triton and Torch match")
 
-        dA = torch.randn(batch_size, d_model * 8 // 2, device=x.device, dtype=x.dtype)
-        torch_forward.backward(dA)
         torch_grad = torch_nn.linear.weight.grad
         assert torch_grad is not None
         torch_grad = torch_grad.T
