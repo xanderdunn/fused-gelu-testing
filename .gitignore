@@ -1,0 +1,4 @@
+# benchmark outputs
+*.html
+*.png
+*.csv

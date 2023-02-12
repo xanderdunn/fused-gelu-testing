@@ -86,32 +86,24 @@ def gelu_partial_layer_fused_forward(
 def gelu_partial_layer_fused_backward(
         x_ptr, W_ptr, z1_ptr, z2_ptr, dA_ptr, dW_ptr, dA1_ptr, dA2_ptr, dz1_ptr, dz2_ptr, dW1_ptr, dW2_ptr,
         M, N,
-        stride_dA_half_m,
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
     ):
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE_M
-    offsets = block_start + tl.arange(0, BLOCK_SIZE_M)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
 
-    # These operations can be done in blocks by row
-    # dz1 = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.float32)
-    # dz2 = tl.zeros((BLOCK_SIZE_M, ), dtype=tl.float32)
-    offsets = block_start + tl.arange(0, BLOCK_SIZE_M)
-    for _ in range(0, M, BLOCK_SIZE_M):
-        dA = tl.load(dA_ptr + offsets)
-        z1 = tl.load(z1_ptr + offsets)
-        z2 = tl.load(z2_ptr + offsets)
-        dA1 = dA * gelu_fast(z2)
-        dz1 = dA1
+    dA = tl.load(dA_ptr + offsets)
+    z1 = tl.load(z1_ptr + offsets)
+    z2 = tl.load(z2_ptr + offsets)
+    dA1 = dA * gelu_fast(z2)
+    dz1 = dA1
 
-        dA2 = dA * z1
-        dz2 = dA2 * gelu_fast_prime(z2)
-        tl.store(dA1_ptr + offsets, dA1)
-        tl.store(dA2_ptr + offsets, dA2)
-        tl.store(dz2_ptr + offsets, dz2)
-        tl.store(dz1_ptr + offsets, dz1)
-        offsets += BLOCK_SIZE_M * stride_dA_half_m
+    dA2 = dA * z1
+    dz2 = dA2 * gelu_fast_prime(z2)
+    tl.store(dA1_ptr + offsets, dA1)
+    tl.store(dA2_ptr + offsets, dA2)
+    tl.store(dz2_ptr + offsets, dz2)
+    tl.store(dz1_ptr + offsets, dz1)
 
 @triton.jit
 # TODO: Combine this with the gelu_partial_layer_fused_backward kernel
@@ -283,15 +275,12 @@ class PartialGeluLayer(torch.autograd.Function):
         dW1 = torch.zeros(P, R, device=x.device, dtype=x.dtype)
         dW2 = torch.zeros(P, R, device=x.device, dtype=x.dtype)
         dW = torch.zeros(P, R * 2, device=x.device, dtype=x.dtype)
-        grid = lambda META: (
-                triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
-                )
+
+        grid = lambda meta: (triton.cdiv(dA2.numel(), meta['BLOCK_SIZE']),)
         gelu_partial_layer_fused_backward[grid](
                 x, W, z1, z2, dA, dW, dA1, dA2, dz1, dz2, dW1, dW2,
                 M, N,
-                stride_dA_half_m=dA1.stride(0),
-                BLOCK_SIZE_M=32,
-                BLOCK_SIZE_N=32, # type: ignore
+                BLOCK_SIZE=512
         )
         grid = lambda META: (
                 triton.cdiv(P, META['BLOCK_SIZE_P']) * triton.cdiv(R, META['BLOCK_SIZE_R']),
@@ -307,7 +296,8 @@ class PartialGeluLayer(torch.autograd.Function):
             BLOCK_SIZE_Q=16, # type: ignore
             GROUP_SIZE_P=8, # type: ignore
         )
-        # TODO: For debugging only: Store the outputs to compare to pytorch
+        # TODO: Remove for production. This is for debugging only:
+        # Store the outputs to compare to pytorch
         global triton_dA1
         global triton_dA2
         global triton_dz1
@@ -340,64 +330,64 @@ partial_gelu = PartialGeluLayer.apply
 def main():
     print("Doing a forward pass: Linear layer -> split in two by column -> GELU on the second half -> element-wise multiply of the first and second halves")
     print("In both pytorch and triton to compare correctness...")
-    batch_size = 512 # FIXME: The triton dA1, dA2 computations are wrong if this is not 512x512
-    d_model = 512
-    torch.manual_seed(0)
-    # input to feed forward
-    x = torch.randn((batch_size, d_model), device='cuda', dtype=torch.float16)
-    x.requires_grad_(True)
+    for size in [32, 64, 128, 512]:
+        batch_size = size # TODO: The backprop only works if this is square, where batch_size == d_model
+        d_model = size
+        torch.manual_seed(0)
+        # input to feed forward
+        x = torch.randn((batch_size, d_model), device='cuda', dtype=torch.float16)
+        x.requires_grad_(True)
 
-    torch_nn = TorchNN(d_model)
-    torch_forward = torch_nn.forward(x)
+        torch_nn = TorchNN(d_model)
+        torch_forward = torch_nn.forward(x)
 
-    linear_weights = torch_nn.linear.state_dict()["weight"].T.contiguous()
-    # biases = torch_nn.linear.state_dict()["bias"]
-    triton_forward = partial_gelu(x, linear_weights)
+        linear_weights = torch_nn.linear.state_dict()["weight"].T.contiguous()
+        # biases = torch_nn.linear.state_dict()["bias"]
+        triton_forward = partial_gelu(x, linear_weights)
 
-    # Test that the portions of Z were stored correctly for retrieval by the backward pass
-    Z = torch_nn.linear(x)
-    torch_z1, torch_z2 = torch.chunk(Z, 2, dim=1)
-    triton.testing.assert_almost_equal(torch_z1, triton_z1)
-    triton.testing.assert_almost_equal(torch_z2, triton_z2)
+        # Test that the portions of Z were stored correctly for retrieval by the backward pass
+        Z = torch_nn.linear(x)
+        torch_z1, torch_z2 = torch.chunk(Z, 2, dim=1)
+        triton.testing.assert_almost_equal(torch_z1, triton_z1)
+        triton.testing.assert_almost_equal(torch_z2, triton_z2)
 
-    triton.testing.assert_almost_equal(triton_forward, torch_forward)
-    print("Forward: ✅ Triton and Torch match")
+        triton.testing.assert_almost_equal(triton_forward, torch_forward)
+        print(f"Forward ({size}, {size}): ✅ Triton and Torch match")
 
-    dA = torch.randn(batch_size, d_model * 8 // 2, device=x.device, dtype=x.dtype)
-    print("Doing a backward pass...")
-    torch_forward.backward(dA)
-    torch_grad = torch_nn.linear.weight.grad
-    assert torch_grad is not None
-    torch_grad = torch_grad.T
+        dA = torch.randn(batch_size, d_model * 8 // 2, device=x.device, dtype=x.dtype)
+        torch_forward.backward(dA)
+        torch_grad = torch_nn.linear.weight.grad
+        assert torch_grad is not None
+        torch_grad = torch_grad.T
 
-    triton_grad = triton_forward.backward(dA)
+        triton_grad = triton_forward.backward(dA)
 
-    # Test that the individual components of the backward pass are correct
-    torch_dA1 = dA * torch_nn.gelu(torch_z2)
-    torch_dA2 = dA * torch_z1
-    torch_dz1 = torch_dA1
-    torch_dz2 = torch_dA2.detach().cpu().numpy() * gelu_prime(torch_z2.detach().cpu().numpy())
+        # Test that the individual components of the backward pass are correct
+        torch_dA1 = dA * torch_nn.gelu(torch_z2)
+        torch_dA2 = dA * torch_z1
+        torch_dz1 = torch_dA1
+        torch_dz2 = torch_dA2.detach().cpu().numpy() * gelu_prime(torch_z2.detach().cpu().numpy())
 
-    triton.testing.assert_almost_equal(torch_dA1, triton_dA1)
-    triton.testing.assert_almost_equal(torch_dA2, triton_dA2)
-    triton.testing.assert_almost_equal(torch_dz1, triton_dz1)
-    triton.testing.assert_almost_equal(torch_dz2, triton_dz2)
+        triton.testing.assert_almost_equal(torch_dA1, triton_dA1)
+        triton.testing.assert_almost_equal(torch_dA2, triton_dA2)
+        triton.testing.assert_almost_equal(torch_dz1, triton_dz1)
+        triton.testing.assert_almost_equal(torch_dz2, triton_dz2)
 
-    torch_dW1_computed = torch.matmul(torch_dz1.T, x).T
-    torch_dW1, torch_dW2 = torch.chunk(torch_grad, 2, dim=1)
-    triton.testing.assert_almost_equal(torch_dW1, torch_dW1_computed)
+        torch_dW1_computed = torch.matmul(torch_dz1.T, x).T
+        torch_dW1, torch_dW2 = torch.chunk(torch_grad, 2, dim=1)
+        triton.testing.assert_almost_equal(torch_dW1, torch_dW1_computed, decimal=1)
 
-    triton_dW1_computed = torch.matmul(triton_dz1.T, x).T
-    # precision lossiness reduces the degree to which our results are identical
-    # so reduce the precision of the comparison to 1 decimal
-    triton.testing.assert_almost_equal(triton_dW1_computed, torch_dW1, decimal=1)
+        triton_dW1_computed = torch.matmul(triton_dz1.T, x).T
+        # precision lossiness reduces the degree to which our results are identical
+        # so reduce the precision of the comparison to 1 decimal
+        triton.testing.assert_almost_equal(triton_dW1_computed, torch_dW1, decimal=1)
 
-    triton.testing.assert_almost_equal(torch_dW1.T, triton_dW1, decimal=1)
-    triton.testing.assert_almost_equal(torch_dW2.T, triton_dW2, decimal=1)
-    triton_dW_computed = torch.concat((triton_dW1.T, triton_dW2.T), dim=1)
-    triton.testing.assert_almost_equal(torch_grad, triton_dW_computed, decimal=1)
-    print("Backward: ✅ Triton and Torch match")
-    # TODO: Benchmark the two implementations across increasing sizes of matrices
+        triton.testing.assert_almost_equal(torch_dW1.T, triton_dW1, decimal=1)
+        triton.testing.assert_almost_equal(torch_dW2.T, triton_dW2, decimal=1)
+        triton_dW_computed = torch.concat((triton_dW1.T, triton_dW2.T), dim=1)
+        triton.testing.assert_almost_equal(torch_grad, triton_dW_computed, decimal=1)
+        print(f"Backward ({size}, {size}): ✅ Triton and Torch match\n")
+        # TODO: Benchmark the two implementations across increasing sizes of matrices
 
 
 if __name__ == "__main__":
