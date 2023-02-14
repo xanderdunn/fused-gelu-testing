@@ -159,7 +159,7 @@ def gelu_partial_layer_fused_backward_matmul(
     # Iterate to compute a block of the dW1 and dW2 matrices
     accumulator_dW1 = tl.zeros((BLOCK_SIZE_P, BLOCK_SIZE_R), dtype=tl.float32)
     accumulator_dW2 = tl.zeros((BLOCK_SIZE_P, BLOCK_SIZE_R), dtype=tl.float32)
-    for k in range(0, Q, BLOCK_SIZE_Q):
+    for _ in range(0, Q, BLOCK_SIZE_Q):
         dz1 = tl.load(dz1_ptrs)
         b = tl.load(b_ptrs)
         dz2 = tl.load(dz2_ptrs)
@@ -300,7 +300,7 @@ class PartialGeluLayer(torch.autograd.Function):
         dW = torch.zeros(R, P * 2, device=x.device, dtype=x.dtype)
 
         grid = lambda meta: (triton.cdiv(dA2.numel(), meta['BLOCK_SIZE']),)
-        gelu_partial_layer_fused_backward[grid](
+        gelu_partial_layer_fused_backward[grid]( # type: ignore
                 x, W, z1, z2, dA, dW, dA1, dA2, dz1, dz2,
                 M, N,
                 BLOCK_SIZE=512
@@ -308,7 +308,7 @@ class PartialGeluLayer(torch.autograd.Function):
         grid = lambda META: (
                 triton.cdiv(P, META['BLOCK_SIZE_P']) * triton.cdiv(R, META['BLOCK_SIZE_R']),
                 )
-        gelu_partial_layer_fused_backward_matmul[grid](
+        gelu_partial_layer_fused_backward_matmul[grid]( # type: ignore
             dz1, x, dz2, dW,
             P, R, Q,
             dz1.T.stride(0), dz1.T.stride(1),
@@ -447,15 +447,19 @@ def benchmark(size, provider: str, mode: str):
     x = torch.randn((size, size), device='cuda', dtype=torch.float16)
     if provider == 'pytorch':
         forward_f = lambda: torch_nn.forward(x)
-    if provider == 'triton':
+    elif provider == 'triton':
         forward_f = lambda: partial_gelu(x, linear_weights)
+    else:
+        assert(False), "Got invalid provider {}".format(provider)
     if mode == "forward":
         ms, min_ms, max_ms = triton.testing.do_bench(forward_f)
-    if mode == "backward":
+    elif mode == "backward":
         x.requires_grad_(True)
         forward = forward_f()
         dA = torch.randn(size, size * 8 // 2, device=x.device, dtype=x.dtype)
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: forward.backward(dA, retain_graph=True))
+    else:
+        assert(False), "Got invalid mode {}".format(mode)
     # TODO: This perf function should be better estimated for the forward and backward passes
     perf = lambda ms: 2 * size * size * size  * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
