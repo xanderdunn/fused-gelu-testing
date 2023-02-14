@@ -207,12 +207,12 @@ def gelu_prime(x: np.ndarray) -> np.ndarray:
     From https://github.com/MarkTigchelaar/Tinman/blob/27a492c06105d550d7eacd2ca9fadc089d484c3a/src/neural_network_parts/activator.rs#L232
     In my testing this is a close approximation but not exact match of the backward pass of the pytorch GELU()
     """
-    term1 = 0.0356774 * x * x * x;
-    term2 = 0.398942 * x;
-    term3 = 0.797885 * x;
-    term4 = 0.0535161  * x * x * x;
-    hyp_secant = 1 / np.cosh(term1 + term3);
-    hyp_secant *= hyp_secant;
+    term1 = 0.0356774 * x * x * x
+    term2 = 0.398942 * x
+    term3 = 0.797885 * x
+    term4 = 0.0535161  * x * x * x
+    hyp_secant = 1 / np.cosh(term1 + term3)
+    hyp_secant *= hyp_secant
     return 0.5 * np.tanh(term1 + term3) + (term4 + term2) * hyp_secant + 0.5
 
 @triton.jit
@@ -461,7 +461,8 @@ def benchmark(size, provider: str, mode: str):
     else:
         assert(False), "Got invalid mode {}".format(mode)
     # TODO: This perf function should be better estimated for the forward and backward passes
-    perf = lambda ms: 2 * size * size * size  * 1e-12 / (ms * 1e-3)
+    def perf(ms):
+        return 2 * size * size * size  * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
 def run_benchmarks():
