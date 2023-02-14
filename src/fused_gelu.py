@@ -100,8 +100,7 @@ def gelu_partial_layer_fused_forward(
 
 @triton.jit
 def gelu_partial_layer_fused_backward(
-        x_ptr, W_ptr, z1_ptr, z2_ptr, dA_ptr, dW_ptr, dA1_ptr, dA2_ptr, dz1_ptr, dz2_ptr,
-        M, N,
+        z1_ptr, z2_ptr, dA_ptr, dz1_ptr, dz2_ptr,
         BLOCK_SIZE: tl.constexpr,
     ):
     pid = tl.program_id(axis=0)
@@ -286,11 +285,11 @@ class PartialGeluLayer(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dA: torch.Tensor) -> torch.Tensor:
         x, W, z1, z2 = ctx.saved_tensors
-        M, K = x.shape
+        _, K = x.shape
         K, N = W.shape
         dW = torch.empty(W.shape, device=x.device, dtype=x.dtype)
-        dA1 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
-        dA2 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
+        # dA1 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
+        # dA2 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
         dz1 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
         dz2 = torch.zeros((K, N // 2), device=x.device, dtype=x.dtype)
         assert(dz1.T.shape[1] == x.shape[0])
@@ -299,10 +298,9 @@ class PartialGeluLayer(torch.autograd.Function):
         Q, R = x.shape
         dW = torch.zeros(R, P * 2, device=x.device, dtype=x.dtype)
 
-        grid = lambda meta: (triton.cdiv(dA2.numel(), meta['BLOCK_SIZE']),)
+        grid = lambda meta: (triton.cdiv(dz1.numel(), meta['BLOCK_SIZE']),)
         gelu_partial_layer_fused_backward[grid]( # type: ignore
-                x, W, z1, z2, dA, dW, dA1, dA2, dz1, dz2,
-                M, N,
+                z1, z2, dA, dz1, dz2,
                 BLOCK_SIZE=512
         )
         grid = lambda META: (
