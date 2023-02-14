@@ -16,7 +16,7 @@ def gelu_fast(x):
 Setup an A100 machine for testing and implement both the forward and backward pass in triton.
 
 ### Run
-After setup below, run the fused GELU with `./src/fused_gelu.py`
+After setup below, run the fused GELU with `./src/fused_gelu.py`. This verifies the correctness of both the forward and backward passes against the same implemented in pytorch, and then benchmarks the backward pass by default. This can be set as an arg in the `triton.testing.Benchmark(` function.
 
 ### TODO
 - Add the bias addition to the linear layer of the kernel
