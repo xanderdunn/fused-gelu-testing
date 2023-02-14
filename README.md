@@ -19,9 +19,8 @@ Setup an A100 machine for testing and implement both the forward and backward pa
 After setup below, run the fused GELU with `./src/fused_gelu.py`
 
 ### TODO
-- Run benchmark against pytorch to see that the fused kernel offers performance improvement
-- Add the bias addition to the fused gelu forward kernel
-- The backprop is currently two kernels in serial. Combine them into a single kernel
+- Add the bias addition to the linear layer of the kernel
+- The backprop is currently two kernels in serial. Combine them into a single kernel. This should be done once it's figured out why the split matmul kernel performs so poorly (https://github.com/openai/triton/discussions/1186)
 
 ### Setup
 - Locally install the gcloud command line interface: `brew install gcloud`, this assumes you already have Homebrew installed on your local Mac

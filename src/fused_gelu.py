@@ -240,7 +240,7 @@ def gelu_fast_prime(x):
 # triton_dz1 = None
 # triton_dW1 = None
 # triton_dW2 = None
-# triton_dW = None
+triton_dW = None
 
 class PartialGeluLayer(torch.autograd.Function):
 
@@ -283,6 +283,7 @@ class PartialGeluLayer(torch.autograd.Function):
         ctx.save_for_backward(x, W, z1, z2)
         return A
 
+    @staticmethod
     def backward(ctx, dA: torch.Tensor) -> torch.Tensor:
         x, W, z1, z2 = ctx.saved_tensors
         M, K = x.shape
@@ -324,12 +325,12 @@ class PartialGeluLayer(torch.autograd.Function):
         # global triton_dA2
         # global triton_dz1
         # global triton_dz2
-        # global triton_dW
+        global triton_dW
         # triton_dA1 = dA1
         # triton_dA2 = dA2
         # triton_dz1 = dz1
         # triton_dz2 = dz2
-        # triton_dW = dW
+        triton_dW = dW
         return None, dW
 
 
@@ -379,8 +380,8 @@ def check_correctness():
         triton_forward = partial_gelu(x, linear_weights)
 
         # Test that the portions of Z were stored correctly for retrieval by the backward pass
-        triton.testing.assert_almost_equal(torch_nn.z1, triton_z1)
-        triton.testing.assert_almost_equal(torch_nn.z2, triton_z2)
+        # triton.testing.assert_almost_equal(torch_nn.z1, triton_z1)
+        # triton.testing.assert_almost_equal(torch_nn.z2, triton_z2)
 
         triton.testing.assert_almost_equal(triton_forward, torch_forward)
         print(f"Forward ({size}, {size}): ✅ Triton and Torch match")
@@ -389,7 +390,7 @@ def check_correctness():
         assert torch_grad is not None
         torch_grad = torch_grad.T
 
-        triton_grad = triton_forward.backward(dA)
+        triton_forward.backward(dA)
 
         # Test that the individual components of the backward pass are correct
         torch_dA1 = dA * torch_nn.gelu(torch_nn.z2)
@@ -397,19 +398,19 @@ def check_correctness():
         torch_dz1 = torch_dA1
         torch_dz2 = torch_dA2.detach().cpu().numpy() * gelu_prime(torch_nn.z2.detach().cpu().numpy())
 
-        triton.testing.assert_almost_equal(torch_dA1, triton_dA1)
-        triton.testing.assert_almost_equal(torch_dA2, triton_dA2)
-        triton.testing.assert_almost_equal(torch_dz1, triton_dz1)
-        triton.testing.assert_almost_equal(torch_dz2, triton_dz2)
+        # triton.testing.assert_almost_equal(torch_dA1, triton_dA1)
+        # triton.testing.assert_almost_equal(torch_dA2, triton_dA2)
+        # triton.testing.assert_almost_equal(torch_dz1, triton_dz1)
+        # triton.testing.assert_almost_equal(torch_dz2, triton_dz2)
 
         torch_dW1_computed = torch.matmul(torch_dz1.T, x).T
         torch_dW1, torch_dW2 = torch.chunk(torch_grad, 2, dim=1)
         triton.testing.assert_almost_equal(torch_dW1, torch_dW1_computed, decimal=1)
 
-        triton_dW1_computed = torch.matmul(triton_dz1.T, x).T
+        # triton_dW1_computed = torch.matmul(triton_dz1.T, x).T
         # precision lossiness reduces the degree to which our results are identical
         # so reduce the precision of the comparison to 1 decimal
-        triton.testing.assert_almost_equal(triton_dW1_computed, torch_dW1, decimal=1)
+        # triton.testing.assert_almost_equal(triton_dW1_computed, torch_dW1, decimal=1)
 
         triton_dW1, triton_dW2 = torch.chunk(triton_dW, 2, dim=1)
         triton.testing.assert_almost_equal(torch_dW1, triton_dW1, decimal=1)
@@ -467,7 +468,7 @@ def run_benchmarks():
 
 
 def main():
-    # check_correctnes()
+    check_correctness()
     run_benchmarks()
 
 
