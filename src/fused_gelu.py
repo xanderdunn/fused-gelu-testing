@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from typing import Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -283,7 +285,7 @@ class PartialGeluLayer(torch.autograd.Function):
         return A
 
     @staticmethod
-    def backward(ctx, dA: torch.Tensor) -> torch.Tensor:
+    def backward(ctx, dA: torch.Tensor) -> Tuple[None, torch.Tensor]:
         x, W, z1, z2 = ctx.saved_tensors
         _, K = x.shape
         K, N = W.shape
@@ -407,6 +409,8 @@ def check_correctness():
         # precision lossiness reduces the degree to which our results are identical
         # so reduce the precision of the comparison to 1 decimal
         # triton.testing.assert_almost_equal(triton_dW1_computed, torch_dW1, decimal=1)
+
+        assert triton_dW is not None
 
         triton_dW1, triton_dW2 = torch.chunk(triton_dW, 2, dim=1)
         triton.testing.assert_almost_equal(torch_dW1, triton_dW1, decimal=1)
